@@ -61,8 +61,9 @@ class TestProxyRoute:
         assert resp.status_code == 200
 
     def test_proxy_solves_challenge_on_202(self, client):
+        # Use old format challenge to trigger programmatic solver
         challenge_html = (
-            b'<html><script>window.gokuProps = {"key":"test"};</script>'
+            b'<html><script>window.gokuProps = {"challenge_type":"h72f957df656e80ba55f5d8ce2e8c7ccb59687dba3bfb273d54b08a261b2f3002","difficulty":1};</script>'
             b'<script src="https://challenge-host.example.com/challenge.js"></script></html>'
         )
         ok_resp = MagicMock()
@@ -76,14 +77,14 @@ class TestProxyRoute:
         challenge_resp.headers = {"content-type": "text/html"}
 
         with patch("app.main._session") as mock_session, \
-             patch("app.main.AwsSolver") as mock_solver_cls:
-            mock_solver_cls.return_value.solve.return_value = "fake-token"
+             patch("app.main._solve_challenge_with_old_solver") as mock_solve:
+            mock_solve.return_value = True
             mock_session.request.side_effect = [challenge_resp, ok_resp]
             resp = client.get("/title/tt0111161/")
 
         assert resp.status_code == 200
         assert b"Success" in resp.content
-        mock_solver_cls.return_value.solve.assert_called_once()
+        mock_solve.assert_called_once()
 
     def test_proxy_returns_challenge_if_unsolvable(self, client):
         """If 202 but no gokuProps, return as-is."""

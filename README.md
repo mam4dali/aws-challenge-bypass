@@ -6,12 +6,25 @@ A reverse-proxy microservice that mirrors any website behind **AWS WAF** and aut
 
 - **Full mirror** of any target site — all paths, query strings and content types
 - **All HTTP methods**: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
-- **Automatic AWS WAF challenge solving** using browser fingerprint emulation
+- **Hybrid AWS WAF solving** — Programmatic solver for old format + Browser fallback for new format
 - **Chrome TLS fingerprint impersonation** via `curl_cffi`
 - **WAF token caching** — solves the challenge once, reuses the token for subsequent requests
 - **HTTP proxy support** — route all upstream traffic through a proxy
 - **Raw pass-through** — response body is returned without modification
 - **Cookie forwarding** — client cookies are forwarded to the target site
+
+## How It Works
+
+1. Client sends a request to the proxy (e.g. `GET /title/tt0111161/`)
+2. The proxy forwards it to `https://www.imdb.com/title/tt0111161/` using `curl_cffi` with Chrome TLS fingerprint impersonation
+3. If the target returns **HTTP 202** with a WAF challenge page:
+   - **Hybrid Solver** analyzes the challenge format:
+     - **Old format** → Uses programmatic solver (HashcashScrypt, SHA256, Bandwidth)
+     - **New format** → Falls back to browser-based solving via CDP
+   - The solver extracts `window.gokuProps` from the HTML
+   - For browser mode: Opens a new tab, navigates to solve naturally, extracts cookies
+   - The token is cached and the original request is retried
+4. The response (HTML, JSON, images, etc.) is returned to the client as-is
 
 ## Project Structure
 
@@ -21,7 +34,8 @@ aws-challenge-bypass/
 │   ├── __init__.py
 │   ├── config.py          # Environment configuration loader
 │   ├── main.py            # FastAPI app + proxy logic
-│   ├── solver.py          # AWS WAF challenge solver
+│   ├── solver.py          # AWS WAF challenge solver (old format)
+│   ├── browser_solver.py  # Browser-based solver via CDP (new format)
 │   └── cookie_store.py    # Thread-safe WAF cookie cache
 ├── tests/
 │   ├── __init__.py
@@ -128,6 +142,10 @@ TARGET_ORIGIN=https://www.imdb.com
 IMPERSONATE=chrome
 USER_AGENT=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36
 
+# Browser CDP endpoint for fallback WAF solving (new format challenges)
+# Leave empty to disable browser-based solving
+BROWSER_CDP_ENDPOINT=ws://127.0.0.1:9222
+
 # Proxy (leave empty to disable)
 HTTP_PROXY=
 
@@ -146,9 +164,63 @@ SSL_KEYFILE=
 | `TARGET_ORIGIN` | `https://www.imdb.com` | Upstream target URL (can be changed for other sites) |
 | `IMPERSONATE` | `chrome` | TLS fingerprint to impersonate |
 | `USER_AGENT` | Chrome 145 UA string | User-Agent header for upstream requests |
+| `BROWSER_CDP_ENDPOINT` | *(empty)* | Chrome DevTools Protocol endpoint for browser-based solving |
 | `HTTP_PROXY` | *(empty)* | HTTP/SOCKS proxy URL (e.g. `http://user:pass@host:port` or `socks5://host:port`) |
 | `SSL_CERTFILE` | *(empty)* | Path to SSL certificate file (e.g. `certs/cert.pem`) |
 | `SSL_KEYFILE` | *(empty)* | Path to SSL private key file (e.g. `certs/key.pem`) |
+
+---
+
+### 4. Setting up Chrome DevTools Protocol (CDP) Endpoint
+
+The browser-based solver requires a Chrome/Chromium browser running with remote debugging enabled.
+
+#### macOS / Linux
+
+Start Chrome with remote debugging:
+
+```bash
+# Close all Chrome windows first, then run:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+```
+
+Or use Chromium:
+
+```bash
+chromium --remote-debugging-port=9222
+```
+
+#### Windows
+
+```cmd
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+#### Using a custom port
+
+If you use a different port (e.g., 2001), update your `.env`:
+
+```ini
+BROWSER_CDP_ENDPOINT=ws://127.0.0.1:2001
+```
+
+#### Verify CDP is working
+
+```bash
+curl http://localhost:9222/json/version
+```
+
+Should return JSON with browser info.
+
+#### Remote browser (optional)
+
+If your browser is on a different machine (e.g., remote server), use:
+
+```ini
+BROWSER_CDP_ENDPOINT=ws://192.168.15.100:2001
+```
+
+---
 
 ---
 
@@ -269,14 +341,76 @@ The server will then be available at `https://localhost:8080`.
 
 ## How It Works
 
+### Hybrid Solver Architecture
+
+```
+Request → WAF Challenge? → Detect Format
+                              ↓
+                    ┌─────────┴─────────┐
+                    ↓                   ↓
+               Old Format          New Format
+            (has inputs)      (key/iv/context)
+                    ↓                   ↓
+            Programmatic      Browser via CDP
+              Solver           (New Tab)
+                    ↓                   ↓
+                    └─────────┬─────────┘
+                              ↓
+                        Cache Token
+                              ↓
+                         Retry Request
+```
+
+### Challenge Types
+
+| Format | Detection | Solver | Description |
+|--------|-----------|--------|-------------|
+| Old | `challenge_type` in gokuProps | Programmatic | HashcashScrypt, SHA256, or Bandwidth |
+| New | `key/iv/context` in gokuProps | Browser | Requires real browser to solve |
+
+### Request Flow
+
 1. Client sends a request to the proxy (e.g. `GET /title/tt0111161/`)
 2. The proxy forwards it to `https://www.imdb.com/title/tt0111161/` using `curl_cffi` with Chrome TLS fingerprint impersonation
 3. If the target returns **HTTP 202** with a WAF challenge page:
-   - The solver extracts `window.gokuProps` from the HTML
-   - Builds a browser fingerprint and solves the proof-of-work challenge
-   - Submits the solution and receives an `aws-waf-token`
-   - The token is cached and the original request is retried
+   - **Hybrid detection** analyzes `window.gokuProps` structure
+   - **Old format** → Programmatic solver builds fingerprint, solves PoW, submits solution
+   - **New format** → Opens browser tab, navigates to solve naturally, extracts cookies
+   - Token is cached for subsequent requests
+   - Original request is retried with valid token
 4. The response (HTML, JSON, images, etc.) is returned to the client as-is
+
+---
+
+---
+
+## Troubleshooting
+
+### Browser solver not working
+
+**Problem:** `Browser solver failed` or `WebSocket error: connect ECONNREFUSED`
+
+**Solution:**
+1. Make sure Chrome is running with `--remote-debugging-port=9222`
+2. Verify the endpoint: `curl http://localhost:9222/json/version`
+3. Check `BROWSER_CDP_ENDPOINT` in `.env` matches your port
+
+### Still getting WAF challenges
+
+**Problem:** Requests still return 202 with challenge page
+
+**Possible causes:**
+1. **Cookie expired** — Browser tokens have short lifetime (5-30 min)
+2. **Wrong IP** — Browser and proxy must use same IP
+3. **Missing cookies** — Check that `aws-waf-token` is in cookie store
+
+**Solution:** The proxy will automatically re-solve on next request.
+
+### Challenge type: unknown
+
+**Problem:** Log shows `Challenge type: unknown`
+
+**Solution:** AWS may have changed the challenge format again. Open an issue with the `gokuProps` structure.
 
 ---
 

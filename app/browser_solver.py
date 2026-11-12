@@ -101,7 +101,10 @@ class BrowserSolver:
         async with self._lock:
             browser = await self._ensure_browser()
             if self._context is None:
-                kwargs = {"viewport": {"width": 1920, "height": 1080}}
+                # no_viewport: let the page follow the real window size. A fixed
+                # emulated viewport larger than the window pushes content off-screen,
+                # which hides half of a CAPTCHA that has to be solved by hand.
+                kwargs = {"no_viewport": True}
                 proxy = _playwright_proxy(self.proxy)
                 if proxy:
                     kwargs["proxy"] = proxy

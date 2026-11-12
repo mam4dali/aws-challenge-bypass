@@ -13,6 +13,7 @@ from .config import (
     USER_AGENT,
     IMPERSONATE,
     HTTP_PROXY,
+    BROWSER_PROXY,
     LOG_LEVEL,
     mask_proxy_url,
 )
@@ -65,6 +66,9 @@ async def lifespan(app: FastAPI):
     if HTTP_PROXY:
         session_kwargs["proxy"] = HTTP_PROXY
         logger.info("Using HTTP proxy: %s", mask_proxy_url(HTTP_PROXY))
+    else:
+        logger.info("HTTP proxy: none (curl requests go direct)")
+    logger.info("Browser solver proxy: %s", mask_proxy_url(BROWSER_PROXY))
     _session = curl_requests.Session(**session_kwargs)
     logger.info("WAF Bypass Proxy started")
     yield

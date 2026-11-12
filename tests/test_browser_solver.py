@@ -171,7 +171,8 @@ class TestSolverIntegration:
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from app.browser_solver import BrowserSolver, _playwright_proxy
+from app.browser_solver import BrowserSolver, _cookie_lookup_urls, _playwright_proxy
+from app.config import mask_proxy_url
 
 
 class TestPlaywrightProxy:
@@ -196,6 +197,38 @@ class TestPlaywrightProxy:
         with pytest.raises(ValueError):
             _playwright_proxy("not-a-url")
 
+    @pytest.mark.parametrize("url", ["1.2.3.4:8080", "proxy.local:8080"])
+    def test_schemeless_raises_with_format_hint(self, url):
+        with pytest.raises(ValueError, match="scheme://"):
+            _playwright_proxy(url)
+
+    def test_bad_port_raises_clear_error_without_credentials(self):
+        with pytest.raises(ValueError, match="Invalid proxy port") as exc:
+            _playwright_proxy("http://user:secret@host:80x")
+        assert "secret" not in str(exc.value)
+
+
+class TestMaskProxyUrl:
+    def test_strips_credentials(self):
+        assert mask_proxy_url("http://user:secret@host:3128") == "http://host:3128"
+
+    def test_empty(self):
+        assert mask_proxy_url(None) == "none"
+
+    def test_bad_port_does_not_raise(self):
+        assert mask_proxy_url("http://user:secret@host:80x") == "http://host:<invalid-port>"
+
+
+class TestCookieLookupUrls:
+    def test_https_unchanged(self):
+        assert _cookie_lookup_urls("https://www.imdb.com/title/x/") == ["https://www.imdb.com/title/x/"]
+
+    def test_http_adds_https_variant(self):
+        assert _cookie_lookup_urls("http://example.com/a?b=1") == [
+            "http://example.com/a?b=1",
+            "https://example.com/a?b=1",
+        ]
+
 
 def _fake_browser():
     browser = MagicMock()
@@ -207,7 +240,7 @@ def _fake_browser():
 
 
 def _solver_with(browser, proxy="http://u:p@proxy.local:3128"):
-    solver = BrowserSolver(user_agent="UA/1.0", proxy=proxy)
+    solver = BrowserSolver(proxy=proxy)
     playwright = MagicMock()
     playwright.chromium.connect_over_cdp = AsyncMock(return_value=browser)
     solver._playwright = playwright
@@ -233,7 +266,8 @@ class TestIsolatedContext:
             "username": "u",
             "password": "p",
         }
-        assert kwargs["user_agent"] == "UA/1.0"
+        # Native browser UA is kept (no UA / Client Hints mismatch)
+        assert "user_agent" not in kwargs
         # The browser's default (shared) context is never used
         assert first is not default_ctx
         assert default_ctx.method_calls == []

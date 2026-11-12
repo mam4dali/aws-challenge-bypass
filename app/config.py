@@ -33,7 +33,10 @@ def mask_proxy_url(url: str | None) -> str:
         return "none"
     parsed = urlparse(url)
     host = parsed.hostname or ""
-    port = f":{parsed.port}" if parsed.port else ""
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:  # non-numeric / out-of-range port
+        port = ":<invalid-port>"
     return f"{parsed.scheme}://{host}{port}"
 
 SSL_CERTFILE: str | None = os.getenv("SSL_CERTFILE", "") or None

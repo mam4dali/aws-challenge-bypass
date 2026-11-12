@@ -147,8 +147,9 @@ USER_AGENT=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (K
 BROWSER_CDP_ENDPOINT=ws://127.0.0.1:9222
 
 # Proxy (leave empty to disable)
+# Format: scheme://[user:pass@]host:port, e.g. http://user:pass@1.2.3.4:8080
 HTTP_PROXY=
-# Proxy for the browser solver (leave empty to use HTTP_PROXY)
+# Proxy for the browser solver (same format; leave empty to use HTTP_PROXY)
 BROWSER_PROXY=
 
 # SSL (leave empty to disable HTTPS)

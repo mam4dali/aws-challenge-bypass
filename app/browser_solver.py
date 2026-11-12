@@ -7,7 +7,7 @@ import os
 import asyncio
 import logging
 from typing import Dict
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, urlunparse, unquote
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from dotenv import load_dotenv
 from pathlib import Path
@@ -29,15 +29,29 @@ def _playwright_proxy(url: str | None) -> dict | None:
     if not url:
         return None
     parsed = urlparse(url)
-    if not parsed.hostname:
-        raise ValueError(f"Invalid proxy URL: {mask_proxy_url(url)}")
-    scheme = parsed.scheme or "http"
-    port = f":{parsed.port}" if parsed.port else ""
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError(
+            f"Invalid proxy URL {mask_proxy_url(url)!r}: expected scheme://[user:pass@]host:port, "
+            "e.g. http://user:pass@1.2.3.4:8080"
+        )
+    scheme = parsed.scheme
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        raise ValueError(f"Invalid proxy port in {mask_proxy_url(url)!r}") from None
     proxy = {"server": f"{scheme}://{parsed.hostname}{port}"}
     if parsed.username:
         proxy["username"] = unquote(parsed.username)
         proxy["password"] = unquote(parsed.password or "")
     return proxy
+
+
+def _cookie_lookup_urls(url: str) -> list[str]:
+    """URLs whose cookies belong to the target: the URL itself plus its https:// form."""
+    parsed = urlparse(url)
+    if parsed.scheme == "http":
+        return [url, urlunparse(parsed._replace(scheme="https"))]
+    return [url]
 
 
 class BrowserSolver:
@@ -57,8 +71,10 @@ class BrowserSolver:
     6. Close the tab
     """
 
-    def __init__(self, user_agent: str = None, timeout: int = 30, proxy: str | None = BROWSER_PROXY):
-        self.user_agent = user_agent or os.getenv("USER_AGENT", "") or None
+    def __init__(self, timeout: int = 30, proxy: str | None = BROWSER_PROXY):
+        # The browser keeps its native User-Agent: overriding it (e.g. with the
+        # curl USER_AGENT) would not change Client Hints, and a UA / sec-ch-ua
+        # version mismatch is a bot signal for the WAF challenge.
         self.timeout = timeout
         self.proxy = proxy
         self._browser: Browser = None
@@ -86,8 +102,6 @@ class BrowserSolver:
             browser = await self._ensure_browser()
             if self._context is None:
                 kwargs = {"viewport": {"width": 1920, "height": 1080}}
-                if self.user_agent:
-                    kwargs["user_agent"] = self.user_agent
                 proxy = _playwright_proxy(self.proxy)
                 if proxy:
                     kwargs["proxy"] = proxy
@@ -211,8 +225,10 @@ class BrowserSolver:
                 else:
                     raise RuntimeError(f"Challenge not solved within {self.timeout}s")
 
-            # Extract only the cookies that apply to the target URL
-            cookies = await context.cookies(url)
+            # Extract only the cookies that apply to the target URL. Also look
+            # up its https:// form so Secure cookies (e.g. aws-waf-token set
+            # after an http -> https redirect) are not filtered out.
+            cookies = await context.cookies(_cookie_lookup_urls(url))
             cookie_dict = {c["name"]: c["value"] for c in cookies}
 
             # Verify we got the token
@@ -248,8 +264,7 @@ def get_browser_solver() -> BrowserSolver:
     """Get or create the singleton browser solver instance."""
     global _browser_solver
     if _browser_solver is None:
-        ua = os.getenv("USER_AGENT", "")
-        _browser_solver = BrowserSolver(user_agent=ua)
+        _browser_solver = BrowserSolver()
     return _browser_solver
 
 

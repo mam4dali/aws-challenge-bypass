@@ -7,9 +7,12 @@ import os
 import asyncio
 import logging
 from typing import Dict
+from urllib.parse import urlparse, unquote
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from dotenv import load_dotenv
 from pathlib import Path
+
+from .config import BROWSER_PROXY, mask_proxy_url
 
 # Load .env from project root
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -21,38 +24,101 @@ logger = logging.getLogger(__name__)
 CDP_ENDPOINT = os.getenv("BROWSER_CDP_ENDPOINT", "ws://127.0.0.1:9222")
 
 
+def _playwright_proxy(url: str | None) -> dict | None:
+    """Convert a proxy URL (scheme://user:pass@host:port) to Playwright's proxy dict."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError(f"Invalid proxy URL: {mask_proxy_url(url)}")
+    scheme = parsed.scheme or "http"
+    port = f":{parsed.port}" if parsed.port else ""
+    proxy = {"server": f"{scheme}://{parsed.hostname}{port}"}
+    if parsed.username:
+        proxy["username"] = unquote(parsed.username)
+        proxy["password"] = unquote(parsed.password or "")
+    return proxy
+
+
 class BrowserSolver:
     """
     Solves AWS WAF challenges using a real browser via CDP.
 
+    The browser may be shared with other tools, so the solver never touches
+    the browser's default context. It works in its own isolated context
+    (separate cookies/storage, optional proxy) that is created once and reused.
+
     Flow:
     1. Connect to browser via CDP
-    2. Create new context + page
-    3. Navigate to target URL
+    2. Get (or create) the solver's isolated context
+    3. Open a tab and navigate to target URL
     4. Wait for challenge to be solved
-    5. Extract cookies
-    6. Close page and context
+    5. Extract the target URL's cookies
+    6. Close the tab
     """
 
-    def __init__(self, user_agent: str = None, timeout: int = 30):
-        self.user_agent = user_agent or os.getenv("USER_AGENT", "")
+    def __init__(self, user_agent: str = None, timeout: int = 30, proxy: str | None = BROWSER_PROXY):
+        self.user_agent = user_agent or os.getenv("USER_AGENT", "") or None
         self.timeout = timeout
+        self.proxy = proxy
         self._browser: Browser = None
+        self._context: BrowserContext = None
         self._playwright = None
+        self._lock = asyncio.Lock()
 
     async def _ensure_browser(self) -> Browser:
-        """Connect to browser if not already connected."""
+        """Connect to browser if not already connected (reconnects if the connection dropped)."""
+        if self._browser is not None and not self._browser.is_connected():
+            logger.warning("Browser CDP connection lost, reconnecting")
+            self._browser = None
+            self._context = None
         if self._browser is None:
-            self._playwright = await async_playwright().start()
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
             logger.info(f"Connecting to browser CDP: {CDP_ENDPOINT}")
             self._browser = await self._playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
             logger.info(f"Connected to browser, contexts: {len(self._browser.contexts)}")
         return self._browser
 
+    async def _ensure_context(self) -> BrowserContext:
+        """Return the solver's isolated context, creating it on first use."""
+        async with self._lock:
+            browser = await self._ensure_browser()
+            if self._context is None:
+                kwargs = {"viewport": {"width": 1920, "height": 1080}}
+                if self.user_agent:
+                    kwargs["user_agent"] = self.user_agent
+                proxy = _playwright_proxy(self.proxy)
+                if proxy:
+                    kwargs["proxy"] = proxy
+                context = await browser.new_context(**kwargs)
+                context.on("close", lambda _: self._forget_context(context))
+                self._context = context
+                logger.info(
+                    "Created isolated browser context (proxy: %s)",
+                    mask_proxy_url(self.proxy),
+                )
+            return self._context
+
+    def _forget_context(self, context: BrowserContext) -> None:
+        """Drop our reference when the context is closed (e.g. window closed by hand)."""
+        if self._context is context:
+            logger.info("Isolated browser context closed, will recreate on next solve")
+            self._context = None
+
     async def close(self):
-        """Close browser connection."""
+        """Close the solver's own context and disconnect. The browser itself keeps running."""
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
             self._browser = None
         if self._playwright:
             await self._playwright.stop()
@@ -102,23 +168,11 @@ class BrowserSolver:
         Raises:
             RuntimeError: If challenge cannot be solved
         """
-        browser = await self._ensure_browser()
+        context = await self._ensure_context()
 
         logger.info(f"Opening new tab for: {url}")
 
-        # Reuse existing context (cheaper than creating new one)
-        if browser.contexts:
-            context = browser.contexts[0]
-            logger.debug("Reusing existing browser context")
-        else:
-            # Only create context if none exists
-            context = await browser.new_context(
-                user_agent=self.user_agent,
-                viewport={"width": 1920, "height": 1080},
-            )
-            logger.debug("Created new browser context")
-
-        # Create new page (tab) in existing context
+        # Create new page (tab) in the solver's isolated context
         page = await context.new_page()
         try:
             # Navigate to URL
@@ -157,8 +211,8 @@ class BrowserSolver:
                 else:
                     raise RuntimeError(f"Challenge not solved within {self.timeout}s")
 
-            # Extract cookies from the context
-            cookies = await context.cookies()
+            # Extract only the cookies that apply to the target URL
+            cookies = await context.cookies(url)
             cookie_dict = {c["name"]: c["value"] for c in cookies}
 
             # Verify we got the token

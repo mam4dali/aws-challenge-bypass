@@ -22,6 +22,19 @@ USER_AGENT: str = os.getenv(
 )
 
 HTTP_PROXY: str | None = os.getenv("HTTP_PROXY", "") or None
+# Proxy for the browser solver, as reachable from the machine Chrome runs on.
+# Falls back to HTTP_PROXY when unset.
+BROWSER_PROXY: str | None = os.getenv("BROWSER_PROXY", "") or HTTP_PROXY
+
+
+def mask_proxy_url(url: str | None) -> str:
+    """Return the proxy URL without credentials, safe for logging."""
+    if not url:
+        return "none"
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}"
 
 SSL_CERTFILE: str | None = os.getenv("SSL_CERTFILE", "") or None
 SSL_KEYFILE: str | None = os.getenv("SSL_KEYFILE", "") or None

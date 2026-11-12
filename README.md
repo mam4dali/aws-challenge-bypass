@@ -148,6 +148,8 @@ BROWSER_CDP_ENDPOINT=ws://127.0.0.1:9222
 
 # Proxy (leave empty to disable)
 HTTP_PROXY=
+# Proxy for the browser solver (leave empty to use HTTP_PROXY)
+BROWSER_PROXY=
 
 # SSL (leave empty to disable HTTPS)
 SSL_CERTFILE=
@@ -166,6 +168,7 @@ SSL_KEYFILE=
 | `USER_AGENT` | Chrome 145 UA string | User-Agent header for upstream requests |
 | `BROWSER_CDP_ENDPOINT` | *(empty)* | Chrome DevTools Protocol endpoint for browser-based solving |
 | `HTTP_PROXY` | *(empty)* | HTTP/SOCKS proxy URL (e.g. `http://user:pass@host:port` or `socks5://host:port`) |
+| `BROWSER_PROXY` | *(`HTTP_PROXY`)* | Proxy for the browser solver, as reachable from the machine Chrome runs on |
 | `SSL_CERTFILE` | *(empty)* | Path to SSL certificate file (e.g. `certs/cert.pem`) |
 | `SSL_KEYFILE` | *(empty)* | Path to SSL private key file (e.g. `certs/key.pem`) |
 
@@ -219,6 +222,18 @@ If your browser is on a different machine (e.g., remote server), use:
 ```ini
 BROWSER_CDP_ENDPOINT=ws://192.168.15.100:2001
 ```
+
+#### Sharing the browser with other tools
+
+The solver never uses the browser's default profile. It opens its own isolated
+context (a separate window with its own cookies and storage, like an incognito
+window) and reuses it for every challenge. Only that context goes through the
+proxy (`BROWSER_PROXY`, or `HTTP_PROXY` if unset); other tabs and tools using
+the same Chrome are not affected. Only cookies for the target URL are returned.
+
+If Chrome runs on another machine, the proxy address must be reachable from
+that machine — set `BROWSER_PROXY` when it differs from `HTTP_PROXY`.
+Chromium does not support SOCKS5 proxies with username/password.
 
 ---
 

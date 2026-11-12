@@ -14,6 +14,7 @@ from .config import (
     IMPERSONATE,
     HTTP_PROXY,
     LOG_LEVEL,
+    mask_proxy_url,
 )
 
 logging.basicConfig(
@@ -63,12 +64,16 @@ async def lifespan(app: FastAPI):
     session_kwargs: dict = {"impersonate": IMPERSONATE, "timeout": 30}
     if HTTP_PROXY:
         session_kwargs["proxy"] = HTTP_PROXY
-        logger.info("Using HTTP proxy: %s", HTTP_PROXY)
+        logger.info("Using HTTP proxy: %s", mask_proxy_url(HTTP_PROXY))
     _session = curl_requests.Session(**session_kwargs)
     logger.info("WAF Bypass Proxy started")
     yield
     if _session:
         _session.close()
+    try:
+        await get_browser_solver().close()
+    except Exception as exc:
+        logger.debug("Browser solver close failed: %s", exc)
     logger.info("WAF Bypass Proxy stopped")
 
 

@@ -162,3 +162,125 @@ class TestSolverIntegration:
         challenge_type = detect_challenge_type_sync(html)
         assert challenge_type == "new"
         # New format should trigger browser solver
+
+
+# ---------------------------------------------------------------------------
+# Isolated context / proxy handling (offline, mocked browser)
+# ---------------------------------------------------------------------------
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+from app.browser_solver import BrowserSolver, _playwright_proxy
+
+
+class TestPlaywrightProxy:
+    def test_empty_returns_none(self):
+        assert _playwright_proxy(None) is None
+        assert _playwright_proxy("") is None
+
+    def test_plain_http(self):
+        assert _playwright_proxy("http://10.0.0.5:8888") == {"server": "http://10.0.0.5:8888"}
+
+    def test_with_credentials_decoded(self):
+        assert _playwright_proxy("http://us%40er:p%3Ass@proxy.local:3128") == {
+            "server": "http://proxy.local:3128",
+            "username": "us@er",
+            "password": "p:ss",
+        }
+
+    def test_socks5(self):
+        assert _playwright_proxy("socks5://127.0.0.1:1080") == {"server": "socks5://127.0.0.1:1080"}
+
+    def test_invalid_raises(self):
+        with pytest.raises(ValueError):
+            _playwright_proxy("not-a-url")
+
+
+def _fake_browser():
+    browser = MagicMock()
+    browser.is_connected.return_value = True
+    default_ctx = MagicMock(name="default_ctx")
+    browser.contexts = [default_ctx]
+    browser.new_context = AsyncMock(side_effect=lambda **kw: MagicMock(name="isolated_ctx"))
+    return browser, default_ctx
+
+
+def _solver_with(browser, proxy="http://u:p@proxy.local:3128"):
+    solver = BrowserSolver(user_agent="UA/1.0", proxy=proxy)
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=browser)
+    solver._playwright = playwright
+    return solver, playwright
+
+
+class TestIsolatedContext:
+    def test_creates_context_once_with_proxy(self):
+        browser, default_ctx = _fake_browser()
+        solver, _ = _solver_with(browser)
+
+        async def run():
+            first = await solver._ensure_context()
+            second = await solver._ensure_context()
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first is second
+        browser.new_context.assert_awaited_once()
+        kwargs = browser.new_context.await_args.kwargs
+        assert kwargs["proxy"] == {
+            "server": "http://proxy.local:3128",
+            "username": "u",
+            "password": "p",
+        }
+        assert kwargs["user_agent"] == "UA/1.0"
+        # The browser's default (shared) context is never used
+        assert first is not default_ctx
+        assert default_ctx.method_calls == []
+
+    def test_no_proxy_omits_proxy_kwarg(self):
+        browser, _ = _fake_browser()
+        solver, _ = _solver_with(browser, proxy=None)
+        asyncio.run(solver._ensure_context())
+        assert "proxy" not in browser.new_context.await_args.kwargs
+
+    def test_concurrent_calls_create_single_context(self):
+        browser, _ = _fake_browser()
+        solver, _ = _solver_with(browser)
+
+        async def run():
+            return await asyncio.gather(*(solver._ensure_context() for _ in range(5)))
+
+        results = asyncio.run(run())
+        assert all(r is results[0] for r in results)
+        browser.new_context.assert_awaited_once()
+
+    def test_reconnects_after_disconnect(self):
+        old_browser, _ = _fake_browser()
+        new_browser, _ = _fake_browser()
+        solver, playwright = _solver_with(old_browser)
+        playwright.chromium.connect_over_cdp = AsyncMock(side_effect=[old_browser, new_browser])
+
+        async def run():
+            first = await solver._ensure_context()
+            old_browser.is_connected.return_value = False
+            second = await solver._ensure_context()
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first is not second
+        assert playwright.chromium.connect_over_cdp.await_count == 2
+        new_browser.new_context.assert_awaited_once()
+
+    def test_closed_context_is_recreated(self):
+        browser, _ = _fake_browser()
+        solver, _ = _solver_with(browser)
+
+        async def run():
+            ctx = await solver._ensure_context()
+            solver._forget_context(ctx)  # what the "close" event handler does
+            return ctx, await solver._ensure_context()
+
+        first, second = asyncio.run(run())
+        assert first is not second
+        assert browser.new_context.await_count == 2
